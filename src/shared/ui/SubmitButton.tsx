@@ -1,8 +1,10 @@
 import { PropsWithChildren, FC } from 'react';
-import { AccessibilityProps, StyleSheet, TouchableOpacity } from 'react-native';
+import { AccessibilityProps, StyleSheet } from 'react-native';
 import { StyleProp, ViewStyle } from 'react-native';
 
 import { Stack, styled, StackStyle, TextProps } from '@tamagui/core';
+
+import { TouchableOpacity } from '@shared/ui/TouchableOpacity';
 
 import { Box } from './base';
 import { Spinner } from './Spinner';
@@ -14,9 +16,6 @@ const ButtonText = styled(Text, {
   fontSize: 16,
   lineHeight: 20,
   letterSpacing: 0.15,
-  // I'm not sure why this is throwing a type error, but it works fine, so I'm suppressing it for now.
-  // This is a consequence of the react-native upgrade to version 0.79.2
-  // @ts-expect-error TS2322
   variants: {
     mode: {
       primary: {
@@ -30,6 +29,14 @@ const ButtonText = styled(Text, {
       tonal: {
         color: '$on_secondary_container',
         fontWeight: '400',
+      },
+      text: {
+        color: '$primary',
+        fontWeight: '400',
+      },
+      destructive: {
+        color: '$on_primary',
+        fontWeight: '700',
       },
     },
   } as const,
@@ -59,6 +66,12 @@ const Button = styled(Stack, {
       tonal: {
         backgroundColor: '$secondary_container',
       },
+      text: {
+        backgroundColor: 'transparent',
+      },
+      destructive: {
+        backgroundColor: '$error',
+      },
     },
   },
 });
@@ -68,9 +81,10 @@ type Props = PropsWithChildren<
     onPress?: () => void;
     isLoading?: boolean;
     disabled?: boolean;
-    mode?: 'primary' | 'secondary' | 'tonal';
+    mode?: 'primary' | 'secondary' | 'tonal' | 'text' | 'destructive';
     buttonStyle?: StyleProp<ViewStyle>;
     rightIcon?: React.ReactNode;
+    testID?: string;
   } & {
     textProps?: TextProps;
   } & StackStyle
@@ -86,6 +100,7 @@ export const SubmitButton: FC<Props & AccessibilityProps> = ({
   isLoading = false,
   rightIcon,
   accessibilityLabel,
+  testID = 'submit-button',
   ...stylesProps
 }) => {
   return (
@@ -93,7 +108,7 @@ export const SubmitButton: FC<Props & AccessibilityProps> = ({
       onPress={!disabled ? onPress : undefined}
       disabled={disabled || isLoading}
       accessibilityLabel={accessibilityLabel}
-      testID="submit-button"
+      testID={testID}
     >
       <Button
         style={buttonStyle}
@@ -103,8 +118,6 @@ export const SubmitButton: FC<Props & AccessibilityProps> = ({
         mode={mode}
         {...stylesProps}
       >
-        {/* I'm not sure why this is throwing a type error, but it works fine, so I'm suppressing it for now. */}
-        {/* This is a consequence of the react-native upgrade to version 0.79.2 */}
         {/* @ts-expect-error TS2322 */}
         <ButtonText mode={mode} {...textProps} opacity={isLoading ? 0 : 1}>
           {children}
@@ -121,7 +134,9 @@ export const SubmitButton: FC<Props & AccessibilityProps> = ({
             <Spinner
               size={28}
               color={
-                mode === 'primary' ? palette.on_primary : palette.on_surface
+                mode === 'primary' || mode === 'destructive'
+                  ? palette.on_primary
+                  : palette.on_surface
               }
             />
           </Box>

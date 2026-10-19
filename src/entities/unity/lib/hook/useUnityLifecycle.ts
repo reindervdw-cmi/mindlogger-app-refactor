@@ -1,4 +1,5 @@
 import { useCallback, useContext, useEffect, useRef, useState } from 'react';
+import { Platform } from 'react-native';
 
 import RNUnityView from '@azesmway/react-native-unity';
 import * as mime from 'react-native-mime-types';
@@ -22,7 +23,12 @@ import {
 } from './useRNUnityCommBridge';
 import { useUnityFailureHandler } from './useUnityFailureHandler';
 import { useUnityHeartbeat } from './useUnityHeartbeat';
-import { CONFIG_LOAD_TIMEOUT_MS, STARTUP_TIMEOUT_MS } from '../constants';
+import {
+  CONFIG_LOAD_TIMEOUT_MS,
+  LOAD_CONFIG_RETRY_INTERVAL_MS,
+  REMOUNT_HANDSHAKE_DELAY_MS,
+  STARTUP_TIMEOUT_MS,
+} from '../constants';
 import {
   UnityEventDataExport,
   UnityEventEndUnity,
@@ -30,8 +36,12 @@ import {
   UnityEventUnityStarted,
 } from '../types/unityMessage';
 
+// State that must survive across mounts of the Unity screen.
 const unityRuntimeState = {
   quitInProcess: false,
+  // True once the engine has booted. It stays alive for the rest of the
+  // process, paused between mounts, and does not boot again on remount.
+  engineAlive: false,
 };
 
 type UseUnityLifecycleOptions = {
@@ -64,7 +74,8 @@ export const useUnityLifecycle = (options: UseUnityLifecycleOptions) => {
 
   const { startHeartbeat, stopHeartbeat } = useUnityHeartbeat({
     sendMessageToUnity,
-    onFirstFailure: () => setIsUnityUnresponsive(true),
+    // Unity answered again, so hide the "unresponsive" overlay.
+    onRecovered: () => setIsUnityUnresponsive(false),
     onMaxFailuresReached: () => triggerFailureRef.current(),
   });
 
@@ -88,13 +99,70 @@ export const useUnityLifecycle = (options: UseUnityLifecycleOptions) => {
     triggerFailureRef.current = triggerFailure;
   }, [triggerFailure]);
 
+  // Token for the LoadConfigFile retry loop. Bumping it cancels any loop
+  // that is still running.
+  const loadConfigRunRef = useRef(0);
+
+  // Send the task config to Unity and wait for it to be acknowledged.
   const handleUnityReady = useCallback(async () => {
+    const runId = ++loadConfigRunRef.current;
     try {
-      await sendMessageToUnity({
-        m_sId: uuidv4(),
-        m_sKey: 'LoadConfigFile',
-        m_sAdditionalInfo: payloadFile ?? undefined,
-      });
+      // On Android, Unity can silently drop a LoadConfigFile that arrives
+      // while its scene is still reloading, so resend until acknowledged.
+      // On iOS a single send is enough.
+      const maxAttempts =
+        Platform.OS === 'android'
+          ? Math.max(
+              1,
+              Math.floor(
+                CONFIG_LOAD_TIMEOUT_MS / LOAD_CONFIG_RETRY_INTERVAL_MS,
+              ),
+            )
+          : 1;
+
+      let acknowledged = false;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        const sendPromise = sendMessageToUnity({
+          m_sId: uuidv4(),
+          m_sKey: 'LoadConfigFile',
+          m_sAdditionalInfo: payloadFile ?? undefined,
+        });
+
+        const response =
+          attempt === maxAttempts
+            ? await sendPromise
+            : await Promise.race([
+                sendPromise,
+                new Promise<'no-ack'>(resolve =>
+                  setTimeout(
+                    () => resolve('no-ack'),
+                    LOAD_CONFIG_RETRY_INTERVAL_MS,
+                  ),
+                ),
+              ]);
+
+        if (loadConfigRunRef.current !== runId) {
+          return;
+        }
+
+        if (response !== 'no-ack') {
+          acknowledged = true;
+          logger.log(
+            `[UnityView] LoadConfigFile acknowledged (attempt ${attempt}/${maxAttempts})`,
+          );
+          break;
+        }
+
+        logger.warn(
+          `[UnityView] LoadConfigFile not acknowledged within ${LOAD_CONFIG_RETRY_INTERVAL_MS}ms (attempt ${attempt}/${maxAttempts}) — retrying`,
+        );
+      }
+
+      if (!acknowledged) {
+        // The config load timeout will surface the failure.
+        return;
+      }
+
       if (configLoadTimerRef.current) {
         clearTimeout(configLoadTimerRef.current);
         configLoadTimerRef.current = null;
@@ -102,12 +170,16 @@ export const useUnityLifecycle = (options: UseUnityLifecycleOptions) => {
       setFailureMode('quit');
     } catch (err) {
       logger.error(`[UnityView] LoadConfigFile FAILED: ${err}`);
-      triggerFailure();
+      if (loadConfigRunRef.current === runId) {
+        triggerFailure();
+      }
     }
   }, [payloadFile, logger, sendMessageToUnity, triggerFailure]);
 
+  // Tear down the Unity view and remount it fresh.
   const handleRestartActivity = useCallback(() => {
     logger.log('[UnityView] Restarting Unity activity');
+    loadConfigRunRef.current++;
     restartInProgressRef.current = true;
     stopHeartbeat();
     (resetFailureState as () => void)();
@@ -120,11 +192,14 @@ export const useUnityLifecycle = (options: UseUnityLifecycleOptions) => {
       configLoadTimerRef.current = null;
     }
 
-    // Step 1: fully remove RNUnityView from the tree
+    // Remove RNUnityView from the tree.
     setUnityViewKey(null);
 
-    // Step 2: after a delay, remount with a fresh key so the native layer
-    // has time to tear down before the new view triggers Unity to boot again.
+    // Lock to portrait again so the restarted Unity loads like a fresh start
+    RNOrientationDirector.lockTo(Orientation.portrait);
+
+    // Remount with a fresh key after the native layer has had time to
+    // tear down.
     if (restartTimerRef.current) {
       clearTimeout(restartTimerRef.current);
     }
@@ -136,88 +211,130 @@ export const useUnityLifecycle = (options: UseUnityLifecycleOptions) => {
     }, 1000);
   }, [logger, resetFailureState, stopHeartbeat]);
 
-  // Register Unity ready handler via the `UnityStarted` event.
+  // Start the app side of the startup handshake: heartbeat plus LoadConfigFile.
+  const beginUnityHandshake = useCallback(async () => {
+    if (!unityReadyHandled.current) {
+      unityReadyHandled.current = true;
+      restartInProgressRef.current = false;
+      if (startupTimerRef.current) {
+        clearTimeout(startupTimerRef.current);
+        startupTimerRef.current = null;
+      }
+      setIsUnityUnresponsive(false);
+      startHeartbeat();
+
+      // Surface the error modal if the config does not load in time.
+      configLoadTimerRef.current = setTimeout(() => {
+        logger.warn(
+          `[UnityView] Config did not load within ${CONFIG_LOAD_TIMEOUT_MS}ms — triggering failure`,
+        );
+        setFailureMode('quit');
+        setIsUnityUnresponsive(true);
+        triggerFailureRef.current();
+      }, CONFIG_LOAD_TIMEOUT_MS);
+
+      await handleUnityReady();
+    }
+  }, [handleUnityReady, logger, startHeartbeat]);
+
+  // Keep the ref in sync so the timer always calls the latest version.
+  const beginUnityHandshakeRef = useRef(beginUnityHandshake);
+  useEffect(() => {
+    beginUnityHandshakeRef.current = beginUnityHandshake;
+  }, [beginUnityHandshake]);
+
+  // Start the handshake when Unity reports it has booted.
   const handleUnityStarted =
     useCallback<RNUnityCommBridgeUnityEventHandler>(async () => {
-      if (!unityReadyHandled.current) {
-        unityReadyHandled.current = true;
-        restartInProgressRef.current = false;
-        if (startupTimerRef.current) {
-          clearTimeout(startupTimerRef.current);
-          startupTimerRef.current = null;
-        }
-        setIsUnityUnresponsive(false);
-        startHeartbeat();
-
-        // Start config load timeout — if handleUnityReady doesn't complete
-        // within the deadline, surface the error modal.
-        configLoadTimerRef.current = setTimeout(() => {
-          logger.warn(
-            `[UnityView] Config did not load within ${CONFIG_LOAD_TIMEOUT_MS}ms — triggering failure`,
-          );
-          setFailureMode('quit');
-          setIsUnityUnresponsive(true);
-          triggerFailureRef.current();
-        }, CONFIG_LOAD_TIMEOUT_MS);
-
-        await handleUnityReady();
-      }
-    }, [handleUnityReady, logger, startHeartbeat]);
+      // The engine stays alive for the rest of the process.
+      unityRuntimeState.engineAlive = true;
+      await beginUnityHandshake();
+    }, [beginUnityHandshake]);
   useEffect(() => {
     registerEventHandler(UnityEventUnityStarted, handleUnityStarted);
   }, [handleUnityStarted, registerEventHandler]);
 
-  const handleEndUnity =
-    useCallback<RNUnityCommBridgeUnityEventHandler>(async () => {
-      try {
-        stopHeartbeat();
-        logger.log(
-          `[UnityView] unityPaths: ${JSON.stringify(unityPaths.current)}`,
-        );
-        const mediaFiles: MediaFile[] = unityPaths.current.map(path => {
-          const fileName = path.split('/').pop() ?? '';
+  // Remounts reuse the already-running engine, which resets its own scene at
+  // the end of each task and re-sends UnityStarted on resume. Drive the
+  // handshake ourselves only if that does not happen in time.
+  useEffect(() => {
+    if (!unityViewKey || !unityRuntimeState.engineAlive) {
+      return;
+    }
 
-          return {
-            uri: `file://${path}`,
-            type: mime.lookup(fileName) || '',
-            fileName,
-          };
-        });
+    const handshakeTimer = setTimeout(() => {
+      logger.log(
+        '[UnityView] Keep-alive remount: UnityStarted not received, driving handshake',
+      );
+      beginUnityHandshakeRef.current().catch((err: unknown) => {
+        logger.error(`[UnityView] Keep-alive handshake failed: ${err}`);
+      });
+    }, REMOUNT_HANDSHAKE_DELAY_MS);
 
-        logger.log(`[UnityView] mediaFiles: ${JSON.stringify(mediaFiles)}`);
+    return () => {
+      clearTimeout(handshakeTimer);
+    };
+  }, [logger, unityViewKey]);
 
-        onResponse?.({
-          responseType: 'unity',
-          // TODO: Figure out what this should be
-          startTime: 0,
-          taskData: mediaFiles,
-        });
+  // Collect and return exported files now that the Unity task is done
+  // Unity resets itself before sending EndUnity, so no need to send a Reset message
+  const handleEndUnity = useCallback<RNUnityCommBridgeUnityEventHandler>(() => {
+    try {
+      loadConfigRunRef.current++;
+      stopHeartbeat();
+      logger.log(
+        `[UnityView] unityPaths: ${JSON.stringify(unityPaths.current)}`,
+      );
+      const mediaFiles: MediaFile[] = unityPaths.current.map(path => {
+        const fileName = path.split('/').pop() ?? '';
 
-        await sendMessageToUnity({
-          m_sId: uuidv4(),
-          m_sKey: 'Reset',
-        });
-      } catch (err) {
-        logger.error(`[UnityView] EndUnity handler failed: ${err}`);
-      }
-    }, [logger, onResponse, sendMessageToUnity, stopHeartbeat]);
+        return {
+          uri: `file://${path}`,
+          type: mime.lookup(fileName) || '',
+          fileName,
+        };
+      });
+
+      logger.log(`[UnityView] mediaFiles: ${JSON.stringify(mediaFiles)}`);
+
+      onResponse?.({
+        responseType: 'unity',
+        // TODO: Figure out what this should be
+        startTime: 0,
+        taskData: mediaFiles,
+      });
+    } catch (err) {
+      logger.error(`[UnityView] EndUnity handler failed: ${err}`);
+    }
+  }, [logger, onResponse, stopHeartbeat]);
   useEffect(() => {
     registerEventHandler(UnityEventEndUnity, handleEndUnity);
   }, [handleEndUnity, registerEventHandler]);
 
+  // Collect the file paths Unity exports during the task.
   const handleDataExport = useCallback<RNUnityCommBridgeUnityEventHandler>(
     msg => {
       if (msg.m_sKey === UnityEventDataExport) {
         unityPaths.current = [...unityPaths.current, ...msg.m_listDataPaths];
+
+        sendMessageToUnity({
+          m_sId: uuidv4(),
+          m_sKey: 'DataExportReceived',
+          m_sAdditionalInfo: msg.m_sId,
+        }).catch((err: unknown) => {
+          logger.error(`[UnityView] DataExportReceived send failed: ${err}`);
+        });
       }
     },
-    [logger],
+    [logger, sendMessageToUnity],
   );
   useEffect(() => {
     registerEventHandler(UnityEventDataExport, handleDataExport);
   }, [handleDataExport, registerEventHandler]);
 
-  // Handle orientation change requests from Unity, re-lock to portrait on unmount.
+  // Handle orientation change requests from Unity
+  // - Keep portrait lock from app mount until Unity sends SetOrientation
+  // - Lock to portrait again when Unity unmounts
   const handleSetOrientation = useCallback<RNUnityCommBridgeUnityEventHandler>(
     msg => {
       if (msg.m_sKey === UnityEventSetOrientation) {
@@ -236,6 +353,7 @@ export const useUnityLifecycle = (options: UseUnityLifecycleOptions) => {
 
         const orientation = orientationMap[orientationValue];
         if (orientation !== undefined) {
+          // Lock to orientation specified by Unity in SetOrientation
           RNOrientationDirector.lockTo(orientation);
         } else {
           logger.warn(
@@ -249,10 +367,13 @@ export const useUnityLifecycle = (options: UseUnityLifecycleOptions) => {
   useEffect(() => {
     registerEventHandler(UnityEventSetOrientation, handleSetOrientation);
     return () => {
+      // Lock to portrait again when Unity unmounts
       RNOrientationDirector.lockTo(Orientation.portrait);
     };
   }, [handleSetOrientation, registerEventHandler]);
 
+  // If Unity already quit earlier in this process (iOS), do not trust the
+  // remount and start probing with heartbeats instead.
   useEffect(() => {
     if (
       unityRuntimeState.quitInProcess &&
@@ -269,15 +390,12 @@ export const useUnityLifecycle = (options: UseUnityLifecycleOptions) => {
 
   // IMPORTANT: DO NOT use this effect for anything else!
   useEffect(() => {
-    // (Re)generate a new react key for the RN Unity view so it gets
-    // reinitialized when this container view is rendered for the first time.
-    // This ensure we can consistently get a Unity startup message.
+    // Mount the Unity view with a fresh key so it fully reinitializes.
     const key = uuidv4();
     logger.log(`[UnityView] Mounting Unity view (key=${key})`);
     setUnityViewKey(key);
 
-    // Startup timeout: if UnityStarted is not received within the deadline,
-    // assume Unity failed to boot and surface the error modal.
+    // Surface the error modal if Unity does not start in time.
     startupTimerRef.current = setTimeout(() => {
       if (!unityReadyHandled.current) {
         logger.warn(
@@ -291,6 +409,7 @@ export const useUnityLifecycle = (options: UseUnityLifecycleOptions) => {
 
     return () => {
       logger.log('[UnityView] Unmounting Unity view');
+      loadConfigRunRef.current++;
       suppressErrors();
       stopHeartbeat();
       if (restartTimerRef.current) {
@@ -306,8 +425,10 @@ export const useUnityLifecycle = (options: UseUnityLifecycleOptions) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stopHeartbeat, suppressErrors]);
 
+  // The native player was unloaded, so the next mount needs a fresh boot.
   const handlePlayerUnload = useCallback(() => {
     logger.log('[UnityView] Native player unload received');
+    unityRuntimeState.engineAlive = false;
     if (restartInProgressRef.current) {
       return;
     }
@@ -315,8 +436,11 @@ export const useUnityLifecycle = (options: UseUnityLifecycleOptions) => {
     setIsUnityUnresponsive(true);
   }, [logger]);
 
+  // The native player quit entirely; show the spinner and let the heartbeat
+  // decide whether to surface the error.
   const handlePlayerQuit = useCallback(() => {
     unityRuntimeState.quitInProcess = true;
+    unityRuntimeState.engineAlive = false;
     quitObservedInThisMountRef.current = true;
     setFailureMode('quit');
     logger.warn(
